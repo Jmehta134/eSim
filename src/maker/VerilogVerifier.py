@@ -37,6 +37,7 @@ try:
                             reserved_modules, reserved_name_reason,
                             strip_comments, testbench_matches,
                             top_module_name)
+    from .hdl.hdl_waveform_viewer import waveWindow
 except ImportError:  # launched with src/ on sys.path (absolute-import style)
     from maker import CosimConfig
     from maker import verilog_library
@@ -50,6 +51,7 @@ except ImportError:  # launched with src/ on sys.path (absolute-import style)
                                  reserved_modules, reserved_name_reason,
                                  strip_comments, testbench_matches,
                                  top_module_name)
+    from maker.hdl.hdl_waveform_viewer import waveWindow
 
 # Wall-clock caps for the toolchain so a runaway testbench (e.g. a clock with
 # no $finish) can't hang the worker thread indefinitely. Generous: this tool's
@@ -130,6 +132,7 @@ def make_vcd_plot_window(timestamps, signals_data, signal_types,
     global _VcdPlotWindow
     if _VcdPlotWindow is None:
         import numpy as np
+        import os
         from ngspiceSimulation.plot_window import plotWindow
 
         class VcdPlotWindow(plotWindow):
@@ -138,10 +141,27 @@ def make_vcd_plot_window(timestamps, signals_data, signal_types,
                 self.timestamps = timestamps
                 self.signals_data = signals_data
                 self.signal_types = signal_types
-                # Pass a dummy path to bypass NGSpice reading
-                super().__init__("dummy_path", project_name, parent)
+                # Link directly to the permanent path instead of a dummy path
+                user_home = os.path.expanduser("~")
+                real_path = os.path.join(user_home, "eSim-Workspace", str(project_name))
+                super().__init__(real_path, project_name, parent)
 
             def _parse_tran_start_time(self):
+                return 0.0
+                
+            def _convert_vcd_val(self, val):
+                if isinstance(val, (int, float)):
+                    return float(val)
+                val_str = str(val).strip().lower()
+                if val_str.startswith('b'):
+                    val_str = val_str[1:]
+                if val_str in ('0', '1'):
+                    return float(val_str)
+                if set(val_str).issubset({'0', '1'}):
+                    try:
+                        return float(int(val_str, 2))
+                    except ValueError:
+                        return 0.0
                 return 0.0
 
             def load_simulation_data(self):
@@ -154,19 +174,10 @@ def make_vcd_plot_window(timestamps, signals_data, signal_types,
                         self.x = np.array([])
                         self.y = []
                         self.NBList = []
-                        self.NBIList = []
                         self.volts_length = 0
-                        self.analysisType = 1  # TRANSIENT
-                        self.dec = 0
-
-                    def computeAxes(self):
-                        pass
 
                     def numVals(self):
                         return [len(self.y), self.volts_length]
-
-                    def openFile(self, path):
-                        return [1, 0]
 
                 self.obj_dataext = MockDataExt()
 
@@ -175,8 +186,9 @@ def make_vcd_plot_window(timestamps, signals_data, signal_types,
                         self.timestamps, dtype=np.float64)
                     for name, y_vals in self.signals_data.items():
                         self.obj_dataext.NBList.append(name)
+                        numeric_y = [self._convert_vcd_val(v) for v in y_vals]
                         self.obj_dataext.y.append(
-                            np.array(y_vals, dtype=np.float64))
+                            np.array(numeric_y, dtype=np.float64))
                     self.obj_dataext.volts_length = len(
                         self.obj_dataext.NBList)
 
@@ -185,13 +197,14 @@ def make_vcd_plot_window(timestamps, signals_data, signal_types,
                 self.data_info = self.obj_dataext.numVals()
                 self.volts_length = self.data_info[1]
 
-                self.analysis_label.setText("Verilog Transient Analysis")
+                self.analysis_label.setText("Digital HDL Waveform Analysis")
                 self.populate_waveform_list()
                 self._apply_persisted_layout()
                 self._show_default_traces()
 
-                self.radio_timing.setEnabled(True)
-                self.radio_timing.setChecked(True)
+                if hasattr(self, 'radio_timing'):
+                    self.radio_timing.setEnabled(True)
+                    self.radio_timing.setChecked(True)
 
             def _show_default_traces(self):
                 """Draw something the moment the waveform opens.
@@ -205,20 +218,64 @@ def make_vcd_plot_window(timestamps, signals_data, signal_types,
                 those are exactly the design's ports, which is what the user
                 pressed Simulate to look at. A persisted layout wins; this only
                 fills an otherwise blank plot."""
-                if any(t.visible for t in self.traces.values()):
-                    return              # restored from a previous session
-                top = [i for i, t in sorted(self.traces.items())
-                       if '.' not in t.name and not t.name.startswith('esim_')]
-                chosen = (top or sorted(self.traces))[:12]
-                for i in chosen:
-                    self.traces[i].visible = True
-                for row in range(self.waveform_list.count()):
-                    item = self.waveform_list.item(row)
-                    idx = item.data(QtCore.Qt.ItemDataRole.UserRole)
-                    if isinstance(idx, int) and idx in self.traces:
-                        self.update_list_item_appearance(item, idx)
-                self._refresh_select_all_btn()
-                self._schedule_refresh()
+                if hasattr(self, 'traces') and self.traces:
+                    if not any(t.visible for t in self.traces.values()):
+                        top_signals = [i for i, t in sorted(self.traces.items()) 
+                                       if '.' not in t.name and not t.name.startswith('esim_')]
+                        chosen = (top_signals or sorted(self.traces))[:12]
+                        for i in chosen:
+                            self.traces[i].visible = True
+                    if hasattr(self, 'waveform_list'):
+                        from PyQt6 import QtCore
+                        for row in range(self.waveform_list.count()):
+                            item = self.waveform_list.item(row)
+                            idx = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                            if isinstance(idx, int) and idx in self.traces:
+                                self.update_list_item_appearance(item, idx)
+
+            def update_plot(self):
+                if not hasattr(self, 'fig'): 
+                    return
+                self.fig.clear()
+                visible_traces = [t for t in self.traces.values() if t.visible]
+                
+                if not visible_traces or len(self.obj_dataext.x) == 0:
+                    ax = self.fig.add_subplot(111)
+                    ax.text(0.5, 0.5, 'No digital signals selected', ha='center', va='center', transform=ax.transAxes)
+                    self.canvas.draw_idle()
+                    return
+
+                n = len(visible_traces)
+                gs = self.fig.add_gridspec(n, 1, hspace=0.25)
+                self.panes = []
+
+                for i, t in enumerate(visible_traces):
+                    ax = self.fig.add_subplot(gs[i], sharex=(self.panes[0] if self.panes else None))
+                    self.panes.append(ax)
+
+                    y_vals = self.obj_dataext.y[t.index]
+                    max_y = np.max(y_vals) if len(y_vals) > 0 else 1.0
+
+                    ax.step(self.obj_dataext.x, y_vals, where='post', color=t.color, linewidth=1.8)
+                    
+                    if max_y <= 1.0:
+                        ax.set_ylim(-0.2, 1.2)
+                        ax.set_yticks([0, 1])
+                    else:
+                        ax.set_ylim(-0.5, max_y + 0.5)
+
+                    ax.set_title(t.name, loc='left', color=t.color, fontsize=9, fontweight='bold', pad=2)
+                    
+                    show_grid = self.grid_check.isChecked() if hasattr(self, 'grid_check') else True
+                    ax.grid(show_grid, linestyle='--', alpha=0.5)
+                    
+                    if i < n - 1:
+                        ax.tick_params(labelbottom=False)
+
+                self.canvas.draw_idle()
+
+            refresh_plot = update_plot
+            draw_plot = update_plot
 
         _VcdPlotWindow = VcdPlotWindow
     return _VcdPlotWindow(timestamps, signals_data, signal_types,
@@ -2174,16 +2231,18 @@ class VerilogVerifier(QtWidgets.QWidget):
         # its own full-width tab, so the verifier keeps no reference that could
         # dangle once that tab is closed/destroyed.
         plot = make_vcd_plot_window(timestamps, signals_data, signal_types,
-                                    "Verilog Simulation")
+                                    getattr(self, 'current_project_name', 'Verilog Simulation'))
 
-        self.act_export_csv.setEnabled(True)
+        if hasattr(self, 'act_export_csv'):
+            self.act_export_csv.setEnabled(True)
+            
         # The host (Flow Navigator -> DockArea) takes ownership of this
         # parentless plot when it docks it. If nothing is listening (verifier
         # used standalone), drop it rather than leaking an unparented window.
         if self.receivers(self.waveformReady) > 0:
             self.waveformReady.emit(plot)
         else:
-            plot.deleteLater()
+            plot.show()
             
     def export_csv(self):
         if not hasattr(self, 'current_timestamps') or not self.current_timestamps:
@@ -2892,16 +2951,46 @@ class VerilogVerifier(QtWidgets.QWidget):
             except Exception as ex:
                 self.log(f"Error: failed to parse VCD — {ex}")
 
+        # --- HARDCODED PERMANENT VCD DISK WRITE & DOCKING ---
+        if run.vcd_content:
+            import os
+            import sys
+            
+            user_home = os.path.expanduser("~")
+            proj_name = getattr(self, 'current_project_name', 'course_task')
+            proj_dir = os.path.join(user_home, "eSim-Workspace", str(proj_name))
+            os.makedirs(proj_dir, exist_ok=True)
+            
+            vcd_name = run.vcd_name if run.vcd_name else "sim_out.vcd"
+            vcd_path = os.path.join(proj_dir, vcd_name)
+            
+            with open(vcd_path, "w", encoding="utf-8") as f:
+                f.write(run.vcd_content)
+                
+            src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+            if src_dir not in sys.path:
+                sys.path.insert(0, src_dir)
+            
+            # Instantiate custom viewer linked directly to the permanent path
+            self.wave_win = waveWindow(proj_dir, proj_name)
+            
+            # Emit to the Flow Navigator dock tab cleanly
+            if self.receivers(self.waveformReady) > 0:
+                self.waveformReady.emit(self.wave_win)
+            else:
+                self.wave_win.show()
+
         if parsed and parsed[0]:
             timestamps, signals_data, signal_types, raw_signals, timescale = parsed
             self.current_raw_signals_data = raw_signals
             self.current_timescale = timescale
-            self.render_waveform(timestamps, signals_data, signal_types)
             if run.vcd_name and run.vcd_name != "sim_out.vcd":
                 self.log(f"Read waveform from {run.vcd_name}.")
             self.log(f"Waveform ready — {len(signals_data)} signal(s), "
                      f"{len(timestamps)} sample(s).")
             self._warn_if_undriven(signals_data, raw_signals)
+            if hasattr(self, 'act_export_csv'):
+                self.act_export_csv.setEnabled(True)
         elif run.vcd_content:
             self.log("Error: the simulation dumped a waveform with no value "
                      "changes. Check that the testbench drives the design "
