@@ -949,6 +949,7 @@ class waveWindow(QWidget):
                 f"Width: {sig['width']} bit(s)"
             )
             self.waveform_list.addItem(item)
+            item.setSelected(True)  # Keep highlight synced on load
 
         self._update_viewer_information()
 
@@ -960,7 +961,13 @@ class waveWindow(QWidget):
     def on_waveform_toggle(self, item):
         row = self.waveform_list.row(item)
         if row in self.traces:
-            self.traces[row].visible = item.checkState() == Qt.CheckState.Checked
+            new_visible = not self.traces[row].visible
+            self.traces[row].visible = new_visible
+            
+            # Sync both the checkmark and the blue highlight
+            item.setCheckState(Qt.CheckState.Checked if new_visible else Qt.CheckState.Unchecked)
+            item.setSelected(new_visible)
+            
             self.refresh_plot()
 
     def toggle_select_all_waveforms(self):
@@ -969,15 +976,18 @@ class waveWindow(QWidget):
             if self.select_all_btn.text() == "Deselect All"
             else Qt.CheckState.Checked
         )
+        is_visible = (state == Qt.CheckState.Checked)
 
         for i in range(self.waveform_list.count()):
-            self.waveform_list.item(i).setCheckState(state)
+            item = self.waveform_list.item(i)
+            item.setCheckState(state)
+            item.setSelected(is_visible)  # Sync highlight
 
         for trace in self.traces.values():
-            trace.visible = state == Qt.CheckState.Checked
+            trace.visible = is_visible
 
         self.select_all_btn.setText(
-            "Select All" if state == Qt.CheckState.Unchecked else "Deselect All"
+            "Select All" if not is_visible else "Deselect All"
         )
         self.refresh_plot()
 
@@ -1151,8 +1161,12 @@ class waveWindow(QWidget):
 
         self._rendering = True
         try:
-            old_xlim = self.fig.axes[0].get_xlim() if self.fig.axes else None
-            if old_xlim is None:
+            was_empty = getattr(self, '_is_empty_view', False)
+            
+            old_xlim = None
+            if not was_empty and self.fig.axes:
+                old_xlim = self.fig.axes[0].get_xlim()
+            elif not was_empty:
                 old_xlim = self._last_xlim
 
             visible_traces = [
@@ -1176,6 +1190,7 @@ class waveWindow(QWidget):
 
             # Handle Empty View
             if not visible_traces or len(x) == 0:
+                self._is_empty_view = True
                 ax = self.fig.add_axes([0.015, 0.12, 0.975, 0.80])
                 ax.set_facecolor(self._c("wave"))
                 ax.text(
@@ -1197,6 +1212,8 @@ class waveWindow(QWidget):
                 self._update_viewer_information()
                 return
 
+            self._is_empty_view = False
+            
             # Shared Axis Setup
             count = len(visible_traces)
             left = 0.015
